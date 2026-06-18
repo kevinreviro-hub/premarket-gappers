@@ -185,11 +185,12 @@ function renderTjl(doc) {
   ];
   if (!hits.length) { lines.push('*No long setups passed the filters today.*'); return lines.join('\n'); }
   lines.push(`*:white_check_mark: LONG candidates (${hits.length}):*`);
-  for (const h of hits) {
-    lines.push(`\n*${h.symbol}* @ $${h.curr_price}  ·  > prev-day high ${h.prev_daily_high} · > 200SMA ${h.sma200} · > VWAP ${h.vwap}`);
-    if (h.long_reason) lines.push(`> _Why long:_ ${h.long_reason}${h.source ? `  _(${h.source})_` : ''}`);
-    for (const hl of (h.headlines || []).slice(0, 2)) lines.push(`• _${hl}_`);
+  const MAX = 15;   // cap the webhook message (long messages get dropped by Slack)
+  for (const h of hits.slice(0, MAX)) {
+    const why = h.long_reason ? ` — ${String(h.long_reason).slice(0, 140)}${h.source ? ` _(${h.source})_` : ''}` : '';
+    lines.push(`*${h.symbol}* $${h.curr_price} _(>${h.prev_daily_high} hi · >VWAP ${h.vwap})_${why}`);
   }
+  if (hits.length > MAX) lines.push(`_…and ${hits.length - MAX} more — full list in the saved JSON._`);
   return lines.join('\n');
 }
 
