@@ -207,19 +207,20 @@ async function main() {
     await disconnect(); process.exit(2);
   }
 
-  const marker = `./.tjl_done_${ny.ymd}`;            // NY-dated once-per-day guard
+  const hourET = Math.floor(ny.mins / 60);
+  const marker = `./.tjl_done_${ny.ymd}_${String(hourET).padStart(2, '0')}`;  // once-per-HOUR guard (hourly schedule)
   if (SCHEDULED && existsSync(marker)) {
-    console.error('TJL: already ran today (%s ET) — skipping', ny.ymd);
+    console.error('TJL: already ran this hour (%s %02d:00 ET) — skipping', ny.ymd, hourET);
     await disconnect(); process.exit(0);
   }
 
-  const inWindow = ny.mins >= 600 && ny.mins <= 930; // 10:00-15:30 ET
+  const inWindow = ny.mins >= 600 && ny.mins <= 960; // 10:00-16:00 ET (open..close)
   const isWeekday = !['Sat', 'Sun'].includes(ny.wd);
   if (!NO_GATE && (!inWindow || !isWeekday)) {
     return saveExit({
       scanned_at: new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
       status: 'skipped', error: 'outside_trading_window',
-      reason: `NY ${ny.hhmm} ET (${ny.wd}) is outside the 10:00-15:30 ET weekday window; scan not run. Use --no-gate to override.`,
+      reason: `NY ${ny.hhmm} ET (${ny.wd}) is outside the 10:00-16:00 ET weekday window; scan not run. Use --no-gate to override.`,
       candidates_checked: 0, hits: [], all_results: [],
     }, outName(ny));
   }

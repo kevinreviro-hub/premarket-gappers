@@ -1,12 +1,12 @@
 # setup_tjl_schedule.ps1 — (re)install the TJL-Daily scheduled task. Idempotent.
 #
-# Fires 9:00 PM Jakarta (= 10:00 AM ET, US open) on weekdays, then repeats every
-# 15 min for 6h30m so a poke lands across the NY 10:00-15:30 ET window in BOTH
-# DST regimes (EDT 21:00-02:30 Jkt, EST 22:00-03:30 Jkt) — survives DST untouched.
-# Plus an AtLogon trigger + StartWhenAvailable for catch-up if the laptop was
-# asleep at fire time. The scanner (tjl_scanner.mjs --scheduled) is the source of
-# truth: it enforces weekday + 10:00-15:30 ET gate + once-per-day, and only posts
-# to Slack on an actual scan (gate-skips are silent). Does NOT wake the machine.
+# Fires HOURLY 21:00-03:00 Jakarta on weekdays (21:00 + every 1h x6) = the full US
+# RTH session 10:00-16:00 ET in summer (EDT). Plus AtLogon + on-unlock triggers and
+# StartWhenAvailable for catch-up if the laptop was asleep at an hour's fire time.
+# The scanner (tjl_scanner.mjs --scheduled) is the source of truth: it enforces
+# weekday + 10:00-16:00 ET gate + once-per-HOUR, and only posts to Slack on an
+# actual scan (gate-skips are silent). Does NOT wake the machine. (In winter/EST
+# the 21:00 Jkt slot = 09:00 ET premarket and simply gate-skips.)
 
 $ErrorActionPreference = 'Stop'
 $TaskName = 'TJL-Daily'
@@ -19,8 +19,8 @@ $action = New-ScheduledTaskAction -Execute 'C:\Windows\System32\wscript.exe' -Ar
 $at  = '9:00PM'
 $t1  = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday -At $at
 $rep = (New-ScheduledTaskTrigger -Once -At $at `
-        -RepetitionInterval (New-TimeSpan -Minutes 15) `
-        -RepetitionDuration (New-TimeSpan -Hours 6 -Minutes 30)).Repetition
+        -RepetitionInterval (New-TimeSpan -Hours 1) `
+        -RepetitionDuration (New-TimeSpan -Hours 6)).Repetition   # 21:00 + hourly x6 => 21,22,23,00,01,02,03
 $t1.Repetition = $rep
 $t2 = New-ScheduledTaskTrigger -AtLogOn -User $me
 # on workstation unlock — catch-up when you open/unlock the laptop later that morning
@@ -42,5 +42,5 @@ if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
   Write-Output "removed existing task"
 }
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger @($t1, $t2, $t3) -Settings $settings -Principal $principal `
-  -Description 'TJL Long scanner: 21:00 Jakarta (=10:00 ET open) weekdays, repeats through RTH for catch-up, posts to #investment-research-hackathon. Scanner enforces weekday + 10:00-15:30 ET gate + once/day. Does not wake the machine.' | Out-Null
+  -Description 'Pluang Research Long Scanner: HOURLY 21:00-03:00 Jakarta (=10:00-16:00 ET, US open..close) weekdays + logon/unlock catch-up, posts to #investment-research-hackathon. Scanner enforces weekday + 10:00-16:00 ET gate + once/hour. Does not wake the machine.' | Out-Null
 Write-Output "registered: $TaskName"
