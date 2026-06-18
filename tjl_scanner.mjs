@@ -187,8 +187,9 @@ function renderTjl(doc) {
   lines.push(`*:white_check_mark: LONG candidates (${hits.length}):*`);
   const MAX = 15;   // cap the webhook message (long messages get dropped by Slack)
   for (const h of hits.slice(0, MAX)) {
-    const why = h.long_reason ? ` — ${String(h.long_reason).slice(0, 140)}${h.source ? ` _(${h.source})_` : ''}` : '';
+    const why = h.long_reason ? ` — ${String(h.long_reason).slice(0, 130)}${h.source ? ` _(${h.source})_` : ''}` : '';
     lines.push(`*${h.symbol}* $${h.curr_price} _(>${h.prev_daily_high} hi · >VWAP ${h.vwap})_${why}`);
+    if (h.plan && h.plan.stop != null) lines.push(`   :dart: stop *${h.plan.stop}* (support OB) · target *${h.plan.target}* _(${h.plan.target_basis})_ · R:R *${h.plan.rr}*`);
   }
   if (hits.length > MAX) lines.push(`_…and ${hits.length - MAX} more — full list in the saved JSON._`);
   return lines.join('\n');
@@ -207,6 +208,48 @@ async function postWebhook(text) {
 
 function outName(ny) { return `./tjl_watchlist_${ny.ymd}_${ny.hhmm}ET.json`; }
 function saveExit(doc, name, code = 0) { writeFileSync(name, JSON.stringify(doc, null, 2)); console.log('wrote', name); disconnect().finally(() => process.exit(code)); }
+
+// Read 15-min Order Block / Breaker Block zones (LuxAlgo) for the loaded symbol.
+const OB_ZONES_JS = `(function(){
+  var chart=window.TradingViewApi._activeChartWidgetWV.value()._chartWidget;
+  var sources=chart.model().model().dataSources(); var zones=[];
+  for(var si=0;si<sources.length;si++){var s=sources[si];
+    try{ if(!s.metaInfo) continue; var m=s.metaInfo(); var name=m.description||m.shortDescription||'';
+      if(name.indexOf('Order Block')===-1 && name.indexOf('Breaker')===-1) continue;
+      var g=s._graphics; if(!g||!g._primitivesCollection) continue;
+      var outer=g._primitivesCollection.dwgboxes; if(!outer) continue;
+      var inner=outer.get('boxes'); if(!inner) continue; var coll=inner.get(false);
+      if(coll&&coll._primitivesDataById){ coll._primitivesDataById.forEach(function(v){ if(v.y1!=null&&v.y2!=null){ zones.push({high:Math.max(v.y1,v.y2), low:Math.min(v.y1,v.y2)}); } }); }
+    }catch(e){}
+  }
+  return zones;
+})()`;
+
+// Build a long trading plan: stop = below nearest support OB; target = nearest
+// resistance OB above, else a 2R measured move (breakouts at highs have no OB above).
+function computePlan(entry, zones) {
+  const uniq = [], seen = new Set();
+  for (const z of (zones || [])) { const k = z.high + ':' + z.low; if (!seen.has(k)) { seen.add(k); uniq.push(z); } }
+  const below = uniq.filter(z => z.high < entry).sort((a, b) => b.high - a.high);
+  const above = uniq.filter(z => z.low > entry).sort((a, b) => a.low - b.low);
+  const support = below[0] || null, resistance = above[0] || null;
+  const r2 = x => Math.round(x * 100) / 100;
+  const stop = support ? r2(support.low) : null;
+  const risk = stop != null ? r2(entry - stop) : null;
+  let target = null, basis = 'n/a';
+  if (resistance) { target = r2(resistance.low); basis = `OB resistance ${r2(resistance.low)}-${r2(resistance.high)}`; }
+  else if (risk != null && risk > 0) { target = r2(entry + 2 * risk); basis = '2R measured (no overhead OB)'; }
+  const rr = (risk && risk > 0 && target != null) ? r2((target - entry) / risk) : null;
+  return { stop, target, rr, risk, support_zone: support, resistance_zone: resistance, target_basis: basis, n_zones: uniq.length };
+}
+
+async function obPlan(entry) {
+  await setTf('15');
+  await sleep(1300);                          // let the OB/BB indicator render on 15m
+  let zones = await evaluate(OB_ZONES_JS);
+  if (!zones || !zones.length) { await sleep(900); zones = await evaluate(OB_ZONES_JS); }
+  return computePlan(entry, zones || []);
+}
 
 async function main() {
   const ny = nyParts();
@@ -286,13 +329,19 @@ async function main() {
 
   // PASS = long candidates -> fetch the long thesis / catalyst (Benzinga via claude -p)
   const passSyms = all_results.filter(r => r.result === 'PASS').map(r => r.symbol);
-  const catalysts = {};
-  for (const sym of passSyms) { process.stderr.write(`catalyst: ${sym} ...\n`); catalysts[sym] = fetchCatalyst(sym); }
+  const catalysts = {}, plans = {};
+  for (const sym of passSyms) {
+    process.stderr.write(`enrich PASS: ${sym} (catalyst + OB plan) ...\n`);
+    catalysts[sym] = fetchCatalyst(sym);                                  // claude -p (no chart)
+    try { await setSymbol(sym); plans[sym] = await obPlan(metrics[sym].curr_price); } // 15m OB/BB plan
+    catch (e) { plans[sym] = null; process.stderr.write(`  ! ${sym} plan error: ${String(e.message || e).slice(0, 60)}\n`); }
+  }
 
   const hits = passSyms.map(sym => ({
     symbol: sym, curr_price: metrics[sym].curr_price, prev_daily_high: metrics[sym].prev_daily_high,
     sma200: metrics[sym].sma200, pmh: metrics[sym].pmh, vwap: metrics[sym].vwap, today_hod: metrics[sym].today_hod,
     long_reason: catalysts[sym].reason, headlines: catalysts[sym].headlines, source: catalysts[sym].source,
+    plan: plans[sym] || null,
   }));
 
   const doc = {
