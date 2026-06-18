@@ -25,7 +25,8 @@ $t1.Repetition = $rep
 $t2 = New-ScheduledTaskTrigger -AtLogOn -User $me
 
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew `
-  -ExecutionTimeLimit (New-TimeSpan -Minutes 15) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+  -ExecutionTimeLimit (New-TimeSpan -Hours 2) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+# 2h limit: brute-force scan of all ~976 Pluang tickers runs ~1-1.5h.
 # WakeToRun left FALSE on purpose: do not wake the laptop.
 
 $principal = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Limited

@@ -17,6 +17,7 @@
 
 import { evaluate, disconnect } from './src/connection.js';
 import { writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 
 const CHART = "window.TradingViewApi._activeChartWidgetWV.value()";
 const BARS  = "window.TradingViewApi._activeChartWidgetWV.value()._chartWidget.model().mainSeries().bars()";
@@ -25,9 +26,50 @@ const args = process.argv.slice(2);
 const NO_GATE = args.includes('--no-gate');
 const SCHEDULED = args.includes('--scheduled');   // enables once-per-day marker
 const TICKERS = args.filter(a => !a.startsWith('--'));
-const UNIVERSE = TICKERS.length ? TICKERS : ['AMD', 'NVDA', 'MU'];
+const UNIVERSE_CSV = process.env.TJL_UNIVERSE_CSV || './pluang_us_stocks.csv';
+const TOP_N = parseInt(process.env.TJL_TOP_N || '100', 10);   // 0 = all; default top 100 by mkt cap
+let UNIVERSE_SRC = 'args';
+let UNIVERSE = TICKERS;
+if (!UNIVERSE.length) {
+  const fromCsv = loadUniverseFromCsv(UNIVERSE_CSV);   // CSV is ordered by market cap (largest first)
+  if (fromCsv && fromCsv.length) {
+    UNIVERSE = TOP_N > 0 ? fromCsv.slice(0, TOP_N) : fromCsv;
+    UNIVERSE_SRC = `Pluang top-${TOP_N > 0 ? TOP_N : 'all'} by mkt cap`;
+  } else { UNIVERSE = ['AMD', 'NVDA', 'MU']; UNIVERSE_SRC = 'fallback'; }
+}
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// minimal CSV parse (handles quoted fields with embedded commas, e.g. "Robinhood, Inc.")
+function parseCsv(text) {
+  const rows = []; let row = [], field = '', inq = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inq) { if (c === '"') { if (text[i + 1] === '"') { field += '"'; i++; } else inq = false; } else field += c; }
+    else if (c === '"') inq = true;
+    else if (c === ',') { row.push(field); field = ''; }
+    else if (c === '\n') { row.push(field); rows.push(row); row = []; field = ''; }
+    else if (c !== '\r') field += c;
+  }
+  if (field.length || row.length) { row.push(field); rows.push(row); }
+  return rows;
+}
+function loadUniverseFromCsv(path) {
+  try {
+    const rows = parseCsv(readFileSync(path, 'utf8'));
+    if (rows.length < 2) return null;
+    const head = rows[0].map(h => h.trim().toLowerCase());
+    const si = head.indexOf('symbol'), ei = head.indexOf('is_trading_enabled');
+    if (si < 0) return null;
+    const out = [];
+    for (let r = 1; r < rows.length; r++) {
+      const sym = (rows[r][si] || '').trim().toUpperCase();
+      const en = ei >= 0 ? (rows[r][ei] || 'TRUE').trim().toUpperCase() : 'TRUE';
+      if (sym && en !== 'FALSE') out.push(sym);
+    }
+    return out;
+  } catch { return null; }
+}
 
 function nyParts(d = new Date()) {
   const p = new Intl.DateTimeFormat('en-US', {
@@ -100,24 +142,41 @@ async function healthCheck() {
   }
 }
 
+// Why-long catalyst for a PASS ticker, via `claude -p` WebFetch (Benzinga; reliable
+// vs Yahoo /news which 503s). Best-effort: returns nulls on any failure.
+function fetchCatalyst(ticker) {
+  const claudeCmd = process.env.CLAUDE_BIN || (process.env.APPDATA ? `${process.env.APPDATA}\\npm\\claude.cmd` : 'claude');
+  const prompt = `Use the WebFetch tool on https://www.benzinga.com/quote/${ticker} . In ONE sentence, what recent news or catalyst supports going LONG ${ticker} today? Then up to 2 recent headlines verbatim. Just the data, no commentary. Output ONLY compact JSON, no markdown fences: {"reason":"<one sentence or null>","headlines":["<verbatim>"],"source":"benzinga"}`;
+  try {
+    const r = spawnSync(claudeCmd, ['-p', '--allowedTools', 'WebFetch', '--output-format', 'text'],
+      { input: prompt, encoding: 'utf8', timeout: 120000, shell: true });
+    const m = (r.stdout || '').match(/\{[\s\S]*\}/);
+    if (m) { const o = JSON.parse(m[0]); return { reason: o.reason || null, headlines: Array.isArray(o.headlines) ? o.headlines.slice(0, 2).map(String) : [], source: o.source || 'benzinga' }; }
+  } catch { /* best-effort */ }
+  return { reason: null, headlines: [], source: null };
+}
+
 function resolveWebhook() {
   if (process.env.SLACK_WEBHOOK_URL) return process.env.SLACK_WEBHOOK_URL.trim();
   try { return readFileSync('./.slack_webhook', 'utf8').trim() || null; } catch { return null; }
 }
 
 function renderTjl(doc) {
-  if (doc.status === 'skipped') return `:no_entry: *TJL Long Scanner — skipped*\n${doc.reason}`;
-  const lines = [`:dart: *TJL Long Scanner* — ${doc.candidates_checked} checked${doc.note && /no-gate/.test(doc.note) ? '  _(test run, gate bypassed)_' : ''}`];
+  if (doc.status === 'skipped') return `:no_entry: *Pluang Research Long Scanner — skipped*\n${doc.reason}`;
   const hits = doc.hits || [];
-  lines.push(hits.length ? `*:white_check_mark: PASS (${hits.length}):* ${hits.map(h => h.symbol).join(', ')}` : '*No entries passed the filters.*');
-  lines.push('');
-  for (const r of doc.all_results) {
-    const m = (doc.metrics || {})[r.symbol] || {};
-    let d = '';
-    if (r.result === 'fail_daily') d = `curr ${m.curr_price} ≤ prev daily high ${m.prev_daily_high}`;
-    else if (r.result === 'fail_intraday') d = `daily ok, curr ${m.curr_price} ≤ ${m.today_hod == null ? 'premarket high ' + m.pmh : 'HOD'}`;
-    else if (r.result === 'PASS') d = `curr ${m.curr_price} > prev high ${m.prev_daily_high} & intraday high`;
-    lines.push(`${r.result === 'PASS' ? ':white_check_mark:' : '•'} *${r.symbol}* — ${r.result}${d ? ` (${d})` : ''}`);
+  const counts = {}; for (const r of (doc.all_results || [])) counts[r.result] = (counts[r.result] || 0) + 1;
+  const summary = Object.entries(counts).map(([k, v]) => `${v} ${k}`).join(' · ') || 'no results';
+  const lines = [
+    `:dart: *Pluang Research Long Scanner* — ${doc.candidates_checked} Pluang tickers${/bypassed/.test(doc.note || '') ? ' _(test, gate bypassed)_' : ''}`,
+    `_${summary}${doc.scan_span_min != null ? ` · scan ~${doc.scan_span_min}m` : ''}_`,
+    '',
+  ];
+  if (!hits.length) { lines.push('*No long setups passed the filters today.*'); return lines.join('\n'); }
+  lines.push(`*:white_check_mark: LONG candidates (${hits.length}):*`);
+  for (const h of hits) {
+    lines.push(`\n*${h.symbol}* @ $${h.curr_price}  ·  > prev high ${h.prev_daily_high} · > 200SMA ${h.sma200} · > intraday high`);
+    if (h.long_reason) lines.push(`> _Why long:_ ${h.long_reason}${h.source ? `  _(${h.source})_` : ''}`);
+    for (const hl of (h.headlines || []).slice(0, 2)) lines.push(`• _${hl}_`);
   }
   return lines.join('\n');
 }
@@ -165,56 +224,75 @@ async function main() {
     }, outName(ny));
   }
 
+  console.error(`scanning ${UNIVERSE.length} tickers (${UNIVERSE_SRC}) — sequential, expect ~${Math.round(UNIVERSE.length * 5 / 60)} min`);
   const metrics = {};
   const all_results = [];
+  const name = outName(ny);
+  const scanStart = new Date();
+  let done = 0;
   for (const sym of UNIVERSE) {                 // sequential by design
-    process.stderr.write(`scanning ${sym} ...\n`);
-    await setSymbol(sym);
-    await setTf('D');
-    const d = await dailyMetrics();
-    await setTf('1');
-    await enableExtendedHours();
-    const it = await intradayMetrics();
-    if (!d || !it) { metrics[sym] = { error: 'data_unavailable' }; all_results.push({ symbol: sym, result: 'error' }); continue; }
-
-    const curr = it.curr_px;
-    const daily_bo = curr > d.prev_daily_high && d.prev_daily_close > d.sma200;
-    const hod = it.today_hod == null ? -Infinity : it.today_hod;
-    const intraday_bo = curr > it.pmh && curr > hod;
-    const result = (daily_bo && intraday_bo) ? 'PASS' : (!daily_bo ? 'fail_daily' : 'fail_intraday');
-
-    metrics[sym] = {
-      curr_price: curr, prev_daily_high: d.prev_daily_high, prev_daily_close: d.prev_daily_close,
-      sma200: d.sma200, pmh: it.pmh, today_hod: it.today_hod,
-      daily_breakout: daily_bo, intraday_breakout: intraday_bo,
-    };
-    all_results.push({ symbol: sym, result });
+    done++;
+    process.stderr.write(`[${done}/${UNIVERSE.length}] ${sym} ...\n`);
+    try {
+      await setSymbol(sym);
+      await setTf('D');
+      const d = await dailyMetrics();
+      await setTf('1');
+      await enableExtendedHours();
+      const it = await intradayMetrics();
+      if (!d || !it) { metrics[sym] = { error: 'data_unavailable' }; all_results.push({ symbol: sym, result: 'error' }); }
+      else {
+        const curr = it.curr_px;
+        const daily_bo = curr > d.prev_daily_high && d.prev_daily_close > d.sma200;
+        const hod = it.today_hod == null ? -Infinity : it.today_hod;
+        const intraday_bo = curr > it.pmh && curr > hod;
+        const result = (daily_bo && intraday_bo) ? 'PASS' : (!daily_bo ? 'fail_daily' : 'fail_intraday');
+        metrics[sym] = {
+          curr_price: curr, prev_daily_high: d.prev_daily_high, prev_daily_close: d.prev_daily_close,
+          sma200: d.sma200, pmh: it.pmh, today_hod: it.today_hod, daily_breakout: daily_bo, intraday_breakout: intraday_bo,
+        };
+        all_results.push({ symbol: sym, result });
+        if (result === 'PASS') process.stderr.write(`  >>> PASS ${sym} @ ${curr}\n`);
+      }
+    } catch (e) {                               // one bad ticker must not abort the whole run
+      process.stderr.write(`  ! ${sym} error: ${String(e.message || e).slice(0, 80)}\n`);
+      metrics[sym] = { error: 'exception' };
+      all_results.push({ symbol: sym, result: 'error' });
+    }
+    if (done % 25 === 0) {                       // checkpoint partial progress
+      try {
+        writeFileSync(name, JSON.stringify({
+          scanned_at: scanStart.toISOString().replace(/\.\d+Z$/, 'Z'), status: 'in_progress',
+          progress: `${done}/${UNIVERSE.length}`, candidates_checked: done, hits: [], all_results, metrics,
+        }, null, 2));
+      } catch {}
+    }
   }
+  const spanMin = Math.round((new Date() - scanStart) / 60000);
 
-  const hits = all_results.filter(r => r.result === 'PASS').map(r => ({
-    symbol: r.symbol, curr_price: metrics[r.symbol].curr_price, prev_daily_high: metrics[r.symbol].prev_daily_high,
-    sma200: metrics[r.symbol].sma200, pmh: metrics[r.symbol].pmh, today_hod: metrics[r.symbol].today_hod,
+  // PASS = long candidates -> fetch the long thesis / catalyst (Benzinga via claude -p)
+  const passSyms = all_results.filter(r => r.result === 'PASS').map(r => r.symbol);
+  const catalysts = {};
+  for (const sym of passSyms) { process.stderr.write(`catalyst: ${sym} ...\n`); catalysts[sym] = fetchCatalyst(sym); }
+
+  const hits = passSyms.map(sym => ({
+    symbol: sym, curr_price: metrics[sym].curr_price, prev_daily_high: metrics[sym].prev_daily_high,
+    sma200: metrics[sym].sma200, pmh: metrics[sym].pmh, today_hod: metrics[sym].today_hod,
+    long_reason: catalysts[sym].reason, headlines: catalysts[sym].headlines, source: catalysts[sym].source,
   }));
 
   const doc = {
     scanned_at: new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
-    candidates_checked: UNIVERSE.length,
+    universe: UNIVERSE_SRC, candidates_checked: UNIVERSE.length, scan_span_min: spanMin,
     hits, all_results,
-    note: NO_GATE ? 'Ran with --no-gate (time gate bypassed). curr_price = live 1-min price.' : 'curr_price = live 1-min price.',
+    note: `Brute-force scan of ${UNIVERSE.length} Pluang tickers over ~${spanMin} min${NO_GATE ? ' (gate bypassed)' : ''}; curr_price = live 1-min price (note: prices drift across a multi-minute scan).`,
     metrics,
   };
-  const name = outName(ny);
   writeFileSync(name, JSON.stringify(doc, null, 2));
   console.log('wrote', name);
-  for (const r of all_results) {
-    const m = metrics[r.symbol];
-    let reason = '';
-    if (r.result === 'fail_daily') reason = `curr ${m.curr_price} <= prev daily high ${m.prev_daily_high}` + (m.prev_daily_close > m.sma200 ? ` (trend ok: ${m.prev_daily_close} > SMA200 ${m.sma200})` : ` (also below SMA200 ${m.sma200})`);
-    else if (r.result === 'fail_intraday') reason = `daily breakout ok, but curr ${m.curr_price} <= ${m.today_hod == null ? 'premarket high' : 'HOD'} ${m.today_hod == null ? m.pmh : Math.max(m.pmh, m.today_hod)}`;
-    else if (r.result === 'PASS') reason = `curr ${m.curr_price} > prevHigh ${m.prev_daily_high} & > intraday high; trend ${m.prev_daily_close} > SMA200 ${m.sma200}`;
-    else reason = 'data unavailable';
-    console.log(`${r.symbol}: ${r.result} — ${reason}`);
-  }
+  const counts = {}; for (const r of all_results) counts[r.result] = (counts[r.result] || 0) + 1;
+  console.log(`Pluang Research Long Scanner: ${UNIVERSE.length} checked over ~${spanMin}m — ${Object.entries(counts).map(([k, v]) => `${v} ${k}`).join(', ')}`);
+  for (const h of hits) console.log(`PASS ${h.symbol} @ ${h.curr_price} — ${h.long_reason || '(no catalyst)'}`);
   await postWebhook(renderTjl(doc));
   if (SCHEDULED) { try { writeFileSync(marker, new Date().toISOString()); } catch {} }  // mark done for today
   await disconnect();
