@@ -23,6 +23,12 @@ $rep = (New-ScheduledTaskTrigger -Once -At $at `
         -RepetitionDuration (New-TimeSpan -Hours 6 -Minutes 30)).Repetition
 $t1.Repetition = $rep
 $t2 = New-ScheduledTaskTrigger -AtLogOn -User $me
+# on workstation unlock — catch-up when you open/unlock the laptop later that morning
+$cls = Get-CimClass -Namespace Root/Microsoft/Windows/TaskScheduler -ClassName MSFT_TaskSessionStateChangeTrigger
+$t3 = New-CimInstance -CimClass $cls -ClientOnly
+$t3.StateChange = 8        # TASK_SESSION_UNLOCK
+$t3.UserId = $me
+$t3.Enabled = $true
 
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew `
   -ExecutionTimeLimit (New-TimeSpan -Hours 2) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
@@ -35,6 +41,6 @@ if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
   Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
   Write-Output "removed existing task"
 }
-Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger @($t1, $t2) -Settings $settings -Principal $principal `
+Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger @($t1, $t2, $t3) -Settings $settings -Principal $principal `
   -Description 'TJL Long scanner: 21:00 Jakarta (=10:00 ET open) weekdays, repeats through RTH for catch-up, posts to #investment-research-hackathon. Scanner enforces weekday + 10:00-15:30 ET gate + once/day. Does not wake the machine.' | Out-Null
 Write-Output "registered: $TaskName"
