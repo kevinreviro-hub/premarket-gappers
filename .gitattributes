@@ -1,0 +1,8 @@
+# Keep shell/Python scripts LF so they run under bash (incl. MSYS/Git Bash on
+# Windows) regardless of the cloner's core.autocrlf setting. CRLF in a .sh
+# shebang breaks execution ("bad interpreter: .../bash^M").
+*.sh   text eol=lf
+*.py   text eol=lf
+# Windows-native scripts stay CRLF.
+*.ps1  text eol=crlf
+*.vbs  text eol=crlf

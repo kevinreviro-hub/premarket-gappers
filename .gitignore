@@ -4,3 +4,10 @@ scripts/current.pine
 temp_*
 *.log
 discovery-log.json
+.slack_token
+.slack_webhook
+premarket_gappers_*.json
+latest_gappers.json
+gappers_digest.md
+__pycache__/
+*.pyc
