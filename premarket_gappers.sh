@@ -26,7 +26,7 @@
 #
 # Tunable via env (defaults shown):
 #   MIN_GAP_PCT=5  MIN_PRICE=3  MIN_PREMARKET_VOLUME=50000
-#   MIN_RVOL=5  MIN_DOLLAR_VOLUME=1000000  MAX_ATR_EXTENSION=4  TOP_N=10
+#   MIN_RVOL=2  MIN_DOLLAR_VOLUME=1000000  MAX_ATR_EXTENSION=4  TOP_N=10
 #   CLAUDE_BIN=claude  CLAUDE_MODEL=  FETCH_TIMEOUT=45  PY_BIN=python
 
 set -euo pipefail
@@ -35,7 +35,7 @@ set -euo pipefail
 export MIN_GAP_PCT=${MIN_GAP_PCT:-5}
 export MIN_PRICE=${MIN_PRICE:-3}
 export MIN_PREMARKET_VOLUME=${MIN_PREMARKET_VOLUME:-50000}
-export MIN_RVOL=${MIN_RVOL:-5}
+export MIN_RVOL=${MIN_RVOL:-2}
 export MIN_DOLLAR_VOLUME=${MIN_DOLLAR_VOLUME:-1000000}
 export MAX_ATR_EXTENSION=${MAX_ATR_EXTENSION:-4}
 export TOP_N=${TOP_N:-10}
@@ -43,12 +43,16 @@ CLAUDE_BIN=${CLAUDE_BIN:-claude}
 CLAUDE_MODEL=${CLAUDE_MODEL:-}
 FETCH_TIMEOUT=${FETCH_TIMEOUT:-45}
 PY_BIN=${PY_BIN:-python}
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# Allowlist: only keep tickers present (and trading-enabled) in this CSV.
+# Empty/missing -> scan all. Override with ALLOWLIST_FILE=... or =""(disable).
+export ALLOWLIST_FILE=${ALLOWLIST_FILE:-$SCRIPT_DIR/pluang_us_stocks.csv}
 
 YAHOO_URL="https://finance.yahoo.com/markets/stocks/gainers/"
 
 SELFTEST=0
 case "${1:-}" in
-  --self-test) SELFTEST=1 ;;
+  --self-test) SELFTEST=1; export ALLOWLIST_FILE="" ;;   # fixtures aren't in the universe
   --help|-h) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
   "" ) ;;
   * ) echo "unknown argument: $1 (try --help)" >&2; exit 2 ;;
@@ -84,7 +88,7 @@ trap 'rm -rf "$TMP"' EXIT
 
 # ----------------------------------------------- embedded python helper ------
 cat > "$TMP/gappers.py" <<'PY'
-import sys, os, json, re
+import sys, os, json, re, csv
 
 try:  # Windows: avoid \r\n translation and emit UTF-8 (em-dash in summary)
     sys.stdout.reconfigure(encoding='utf-8', newline='\n')
@@ -133,15 +137,40 @@ def fmt(x):
 
 NULL_BZ = {'catalyst': None, 'headlines': [], 'atr14': None}
 
+def load_allowlist():
+    """Set of tradable tickers from ALLOWLIST_FILE (CSV with a 'symbol' column,
+    optional 'is_trading_enabled'). None = no allowlist (scan all)."""
+    path = os.environ.get('ALLOWLIST_FILE', '').strip()
+    if not path:
+        return None
+    if not os.path.exists(path):
+        sys.stderr.write("allowlist: file not found (%s) — scanning all\n" % path)
+        return None
+    syms = set()
+    with open(path, newline='', encoding='utf-8-sig') as f:
+        for row in csv.DictReader(f):
+            sym = (row.get('symbol') or '').strip().upper()
+            enabled = (row.get('is_trading_enabled') or 'TRUE').strip().upper()
+            if sym and enabled != 'FALSE':
+                syms.add(sym)
+    if not syms:
+        sys.stderr.write("allowlist: 0 tickers parsed from %s — aborting (check the CSV)\n" % path)
+        sys.exit(1)
+    sys.stderr.write("allowlist: %d tradable tickers loaded\n" % len(syms))
+    return syms
+
 def do_filter(src, dst):
     data = clean_json(open(src, encoding='utf-8').read())
     if isinstance(data, dict):  # tolerate {"gainers":[...]} or first list value
         data = data.get('gainers') or next((v for v in data.values() if isinstance(v, list)), [])
+    allow = load_allowlist()
     kept = []
     for r in data:
         if not isinstance(r, dict):
             continue
         sym = str(r.get('symbol', '')).strip().upper()
+        if allow is not None and sym not in allow:   # allowlist gate (Pluang universe)
+            continue
         price, gap, vol = num(r.get('price')), num(r.get('gap_pct')), num(r.get('volume'))
         avg = num(r.get('avg_volume'))
         if not sym or None in (price, gap, vol):
