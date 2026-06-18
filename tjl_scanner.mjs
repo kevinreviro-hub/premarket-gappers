@@ -16,13 +16,14 @@
 // (which returns the prior-day daily close when read on the daily timeframe).
 
 import { evaluate, disconnect } from './src/connection.js';
-import { writeFileSync } from 'node:fs';
+import { writeFileSync, readFileSync, existsSync } from 'node:fs';
 
 const CHART = "window.TradingViewApi._activeChartWidgetWV.value()";
 const BARS  = "window.TradingViewApi._activeChartWidgetWV.value()._chartWidget.model().mainSeries().bars()";
 
 const args = process.argv.slice(2);
 const NO_GATE = args.includes('--no-gate');
+const SCHEDULED = args.includes('--scheduled');   // enables once-per-day marker
 const TICKERS = args.filter(a => !a.startsWith('--'));
 const UNIVERSE = TICKERS.length ? TICKERS : ['AMD', 'NVDA', 'MU'];
 
@@ -99,6 +100,39 @@ async function healthCheck() {
   }
 }
 
+function resolveWebhook() {
+  if (process.env.SLACK_WEBHOOK_URL) return process.env.SLACK_WEBHOOK_URL.trim();
+  try { return readFileSync('./.slack_webhook', 'utf8').trim() || null; } catch { return null; }
+}
+
+function renderTjl(doc) {
+  if (doc.status === 'skipped') return `:no_entry: *TJL Long Scanner — skipped*\n${doc.reason}`;
+  const lines = [`:dart: *TJL Long Scanner* — ${doc.candidates_checked} checked${doc.note && /no-gate/.test(doc.note) ? '  _(test run, gate bypassed)_' : ''}`];
+  const hits = doc.hits || [];
+  lines.push(hits.length ? `*:white_check_mark: PASS (${hits.length}):* ${hits.map(h => h.symbol).join(', ')}` : '*No entries passed the filters.*');
+  lines.push('');
+  for (const r of doc.all_results) {
+    const m = (doc.metrics || {})[r.symbol] || {};
+    let d = '';
+    if (r.result === 'fail_daily') d = `curr ${m.curr_price} ≤ prev daily high ${m.prev_daily_high}`;
+    else if (r.result === 'fail_intraday') d = `daily ok, curr ${m.curr_price} ≤ ${m.today_hod == null ? 'premarket high ' + m.pmh : 'HOD'}`;
+    else if (r.result === 'PASS') d = `curr ${m.curr_price} > prev high ${m.prev_daily_high} & intraday high`;
+    lines.push(`${r.result === 'PASS' ? ':white_check_mark:' : '•'} *${r.symbol}* — ${r.result}${d ? ` (${d})` : ''}`);
+  }
+  return lines.join('\n');
+}
+
+async function postWebhook(text) {
+  const url = resolveWebhook();
+  if (!url) { console.error('slack: no webhook (set SLACK_WEBHOOK_URL or .slack_webhook) — skipped'); return false; }
+  try {
+    const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) });
+    const body = (await res.text()).trim();
+    if (res.ok && body === 'ok') { console.error('slack: posted to webhook'); return true; }
+    console.error('slack: webhook post failed (%s %s)', res.status, body.slice(0, 80)); return false;
+  } catch (e) { console.error('slack: webhook error', e.message); return false; }
+}
+
 function outName(ny) { return `./tjl_watchlist_${ny.ymd}_${ny.hhmm}ET.json`; }
 function saveExit(doc, name, code = 0) { writeFileSync(name, JSON.stringify(doc, null, 2)); console.log('wrote', name); disconnect().finally(() => process.exit(code)); }
 
@@ -112,6 +146,12 @@ async function main() {
     console.error('  Get-Process TradingView -EA SilentlyContinue | Stop-Process -Force');
     console.error('  Start-Process "C:\\\\Program Files\\\\WindowsApps\\\\TradingView.Desktop_3.2.0.7916_x64__n534cwy3pjxzj\\\\TradingView.exe" -ArgumentList "--remote-debugging-port=9222"');
     await disconnect(); process.exit(2);
+  }
+
+  const marker = `./.tjl_done_${ny.ymd}`;            // NY-dated once-per-day guard
+  if (SCHEDULED && existsSync(marker)) {
+    console.error('TJL: already ran today (%s ET) — skipping', ny.ymd);
+    await disconnect(); process.exit(0);
   }
 
   const inWindow = ny.mins >= 600 && ny.mins <= 930; // 10:00-15:30 ET
@@ -175,6 +215,8 @@ async function main() {
     else reason = 'data unavailable';
     console.log(`${r.symbol}: ${r.result} — ${reason}`);
   }
+  await postWebhook(renderTjl(doc));
+  if (SCHEDULED) { try { writeFileSync(marker, new Date().toISOString()); } catch {} }  // mark done for today
   await disconnect();
 }
 
