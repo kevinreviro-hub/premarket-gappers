@@ -87,24 +87,61 @@ def webhook(url, text):
         sys.exit(1)
 
 
+def _hvol(v):
+    try:
+        v = float(v)
+    except Exception:
+        return str(v)
+    for unit, d in (("B", 1e9), ("M", 1e6), ("K", 1e3)):
+        if v >= d:
+            return "%.1f%s" % (v / d, unit)
+    return str(int(v))
+
+
+def render_message(path):
+    """Build a clean, human-readable Slack message from a gappers JSON file."""
+    doc = json.load(open(path, encoding="utf-8"))
+    g = doc.get("gappers", []) or []
+    date = (doc.get("scanned_at") or "")[:10]
+    if not g:
+        return ":chart_with_upwards_trend: *Premarket Gappers — %s*\nNo names cleared the filters today." % date
+    out = [":chart_with_upwards_trend: *Premarket Gappers — %s*  _(Pluang-tradable)_" % date,
+           "%d name%s cleared the filters:" % (len(g), "" if len(g) == 1 else "s"), ""]
+    for x in g:
+        out.append("*%s* — *%+.2f%%*  ·  $%s  ·  vol %s" % (
+            x.get("symbol", "?"), float(x.get("gap_pct", 0)),
+            x.get("price", "?"), _hvol(x.get("premarket_volume"))))
+        if x.get("catalyst"):
+            out.append("> %s" % x["catalyst"])
+        for h in (x.get("headlines") or [])[:2]:
+            out.append("• _%s_" % h)
+        out.append("")
+    return "\n".join(out).strip()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--channel")            # bot-token mode
     ap.add_argument("--webhook")            # incoming-webhook mode (no token)
-    ap.add_argument("--text", required=True)
-    ap.add_argument("--file")
+    ap.add_argument("--text")               # explicit message text
+    ap.add_argument("--from-json", dest="from_json")  # render human message from JSON
+    ap.add_argument("--file")               # file to attach (bot-token mode only)
     a = ap.parse_args()
+    text = render_message(a.from_json) if a.from_json else a.text
+    if not text:
+        sys.stderr.write("need --text or --from-json\n")
+        sys.exit(2)
     try:
         if a.webhook:
-            webhook(a.webhook, a.text)
+            webhook(a.webhook, text)
         elif a.channel:
             if not TOKEN:
                 sys.stderr.write("missing SLACK_BOT_TOKEN\n")
                 sys.exit(2)
             if a.file and os.path.exists(a.file):
-                upload_file(a.channel, a.file, a.text)
+                upload_file(a.channel, a.file, text)
             else:
-                post_message(a.channel, a.text)
+                post_message(a.channel, text)
         else:
             sys.stderr.write("need --channel (with token) or --webhook\n")
             sys.exit(2)

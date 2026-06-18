@@ -34,7 +34,7 @@ export PATH="$PATH:/c/Users/kevin/AppData/Roaming/npm:/c/Users/kevin/AppData/Loc
 LOG="$REPO/scheduler.log"
 START_ET=${START_ET:-0830}
 STALE_AFTER_ET=${STALE_AFTER_ET:-0930}
-SLACK_CHANNEL=${SLACK_CHANNEL:-C05KJ50MQMS}                  # #investment-research
+SLACK_CHANNEL=${SLACK_CHANNEL:-C0BB0MRB0FM}                  # #investment-research-hackathon
 SLACK_TOKEN_FILE=${SLACK_TOKEN_FILE:-$REPO/.slack_token}     # gitignored; one line: xoxb-...
 SLACK_WEBHOOK_FILE=${SLACK_WEBHOOK_FILE:-$REPO/.slack_webhook} # gitignored; one line: https://hooks.slack.com/...
 DIGEST="$REPO/gappers_digest.md"                            # local fallback log (append-only)
@@ -54,12 +54,13 @@ slack_notify() {
   SLACK_BOT_TOKEN="$tok" python "$REPO/slack_notify.py" --channel "$SLACK_CHANNEL" "$@" >>"$LOG" 2>&1
 }
 
-# Tier 2: Slack incoming webhook (text only, no token). Returns nonzero if no URL.
+# Tier 2: Slack incoming webhook (text only, no token). Args forwarded to
+# slack_notify.py (e.g. --text "..." or --from-json file). Nonzero if no URL.
 webhook_post() {
   local url="${SLACK_WEBHOOK_URL:-}"
   [[ -z "$url" && -f "$SLACK_WEBHOOK_FILE" ]] && url=$(tr -d ' \r\n' < "$SLACK_WEBHOOK_FILE")
   [[ -z "$url" ]] && return 1
-  python "$REPO/slack_notify.py" --webhook "$url" --text "$1" >>"$LOG" 2>&1
+  python "$REPO/slack_notify.py" --webhook "$url" "$@" >>"$LOG" 2>&1
 }
 
 # Tier 3: best-effort desktop notification (never fatal).
@@ -80,11 +81,13 @@ fallback_notify() {
 # Success delivery: best tier available (token file -> webhook -> local).
 deliver_success() {
   local summary="$1" file="$2"
-  if slack_notify --text "$summary" --file "$file"; then
-    logline "delivered: Slack file + summary -> $SLACK_CHANNEL"
-  elif webhook_post "$summary"$'\n'"(full data on the laptop: $(basename "$file"))"; then
-    logline "delivered: Slack webhook (summary only, no file)"
-    fallback_notify "$summary" "$file"   # also keep the file locally since webhook can't attach it
+  # Slack message is always the human-readable render of the JSON; the JSON file
+  # itself is attached only on the bot-token path (webhooks/MCP can't attach files).
+  if slack_notify --from-json "$file" --file "$file"; then
+    logline "delivered: Slack message + JSON file -> $SLACK_CHANNEL"
+  elif webhook_post --from-json "$file"; then
+    logline "delivered: Slack webhook message (JSON kept locally; webhooks can't attach files)"
+    fallback_notify "$summary" "$file"
   else
     logline "delivered: local fallback only (no Slack creds)"
     fallback_notify "$summary" "$file"
@@ -95,7 +98,7 @@ deliver_success() {
 deliver_failure() {
   local msg="$1"
   if slack_notify --text "$msg"; then logline "failure alert: Slack";
-  elif webhook_post "$msg"; then logline "failure alert: Slack webhook";
+  elif webhook_post --text "$msg"; then logline "failure alert: Slack webhook";
   else logline "failure alert: local fallback"; fallback_notify "$msg" ""; fi
 }
 
