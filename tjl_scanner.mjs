@@ -27,7 +27,7 @@ const NO_GATE = args.includes('--no-gate');
 const SCHEDULED = args.includes('--scheduled');   // enables once-per-day marker
 const TICKERS = args.filter(a => !a.startsWith('--'));
 const UNIVERSE_CSV = process.env.TJL_UNIVERSE_CSV || './pluang_us_stocks.csv';
-const TOP_N = parseInt(process.env.TJL_TOP_N || '100', 10);   // 0 = all; default top 100 by mkt cap
+const TOP_N = parseInt(process.env.TJL_TOP_N || '500', 10);   // 0 = all; default top 500 by mkt cap
 let UNIVERSE_SRC = 'args';
 let UNIVERSE = TICKERS;
 if (!UNIVERSE.length) {
@@ -108,14 +108,21 @@ async function enableExtendedHours() {
 }
 
 async function dailyMetrics() {
+  // prev_daily_* must be the PREVIOUS COMPLETED daily bar, NOT today's still-forming
+  // bar (during RTH the last bar is today, whose high the live price can't exceed).
   return evaluate(`(function(){
     var bars=${BARS};
     if(!bars||typeof bars.lastIndex!=='function') return null;
-    var end=bars.lastIndex(), last=bars.valueAt(end);
-    var start=Math.max(bars.firstIndex(), end-199), closes=[];
-    for(var i=start;i<=end;i++){var v=bars.valueAt(i); if(v) closes.push(v[4]);}
+    function etd(t){return new Intl.DateTimeFormat('en-CA',{timeZone:'America/New_York',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(t*1000));}
+    var today=etd(Date.now()/1000), end=bars.lastIndex(), fi=bars.firstIndex();
+    var pi=end;
+    while(pi>=fi && etd(bars.valueAt(pi)[0])>=today) pi--;   // skip today's forming bar(s)
+    if(pi<fi) return null;
+    var prev=bars.valueAt(pi);
+    var s=Math.max(fi, pi-199), closes=[];
+    for(var i=s;i<=pi;i++){var v=bars.valueAt(i); if(v) closes.push(v[4]);}
     var sma=closes.reduce(function(a,b){return a+b;},0)/closes.length;
-    return {prev_daily_high:last[2], prev_daily_close:last[4], sma200:Math.round(sma*100)/100, n_closes:closes.length};
+    return {prev_daily_high:prev[2], prev_daily_close:prev[4], sma200:Math.round(sma*100)/100, n_closes:closes.length, prev_date:etd(prev[0])};
   })()`);
 }
 
@@ -124,12 +131,17 @@ async function intradayMetrics() {
     var bars=${BARS};
     if(!bars||typeof bars.lastIndex!=='function') return null;
     var end=bars.lastIndex(), start=Math.max(bars.firstIndex(), end-399), arr=[];
-    for(var i=start;i<=end;i++){var v=bars.valueAt(i); if(v) arr.push([v[0],v[2],v[4]]);}
+    for(var i=start;i<=end;i++){var v=bars.valueAt(i); if(v) arr.push([v[0],v[2],v[3],v[4],v[5]]);} // time,high,low,close,vol
     if(!arr.length) return null;
     function et(t){var p=new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}).formatToParts(new Date(t*1000));var o={};p.forEach(function(x){o[x.type]=x.value;});var h=o.hour==='24'?0:parseInt(o.hour,10);return {ymd:o.year+'-'+o.month+'-'+o.day,mins:h*60+parseInt(o.minute,10)};}
-    var nowT=arr[arr.length-1][0], nowET=et(nowT), today=nowET.ymd, pmh=null, hod=null;
-    for(var j=0;j<arr.length;j++){var t=arr[j][0],hi=arr[j][1]; if(t===nowT) continue; var e=et(t); if(e.ymd!==today) continue; if(e.mins>=240&&e.mins<570){if(pmh===null||hi>pmh)pmh=hi;} else if(e.mins>=570){if(hod===null||hi>hod)hod=hi;}}
-    return {pmh:pmh, today_hod:hod, curr_px:arr[arr.length-1][2], now_mins_et:nowET.mins, today_et:today};
+    var nowT=arr[arr.length-1][0], nowET=et(nowT), today=nowET.ymd, pmh=null, hod=null, vN=0, vD=0;
+    for(var j=0;j<arr.length;j++){
+      var t=arr[j][0],hi=arr[j][1],lo=arr[j][2],cl=arr[j][3],vol=arr[j][4]||0; var e=et(t); if(e.ymd!==today) continue;
+      if(e.mins>=240&&e.mins<570){ if(t!==nowT && (pmh===null||hi>pmh)) pmh=hi; }            // premarket high
+      else if(e.mins>=570){ if(t!==nowT && (hod===null||hi>hod)) hod=hi; vN+=((hi+lo+cl)/3)*vol; vD+=vol; } // RTH: HOD + session VWAP
+    }
+    var vwap = vD>0 ? Math.round(vN/vD*100)/100 : null;
+    return {pmh:pmh, today_hod:hod, vwap:vwap, curr_px:arr[arr.length-1][3], now_mins_et:nowET.mins, today_et:today};
   })()`);
 }
 
@@ -174,7 +186,7 @@ function renderTjl(doc) {
   if (!hits.length) { lines.push('*No long setups passed the filters today.*'); return lines.join('\n'); }
   lines.push(`*:white_check_mark: LONG candidates (${hits.length}):*`);
   for (const h of hits) {
-    lines.push(`\n*${h.symbol}* @ $${h.curr_price}  ·  > prev high ${h.prev_daily_high} · > 200SMA ${h.sma200} · > intraday high`);
+    lines.push(`\n*${h.symbol}* @ $${h.curr_price}  ·  > prev-day high ${h.prev_daily_high} · > 200SMA ${h.sma200} · > VWAP ${h.vwap}`);
     if (h.long_reason) lines.push(`> _Why long:_ ${h.long_reason}${h.source ? `  _(${h.source})_` : ''}`);
     for (const hl of (h.headlines || []).slice(0, 2)) lines.push(`• _${hl}_`);
   }
@@ -245,12 +257,12 @@ async function main() {
       else {
         const curr = it.curr_px;
         const daily_bo = curr > d.prev_daily_high && d.prev_daily_close > d.sma200;
-        const hod = it.today_hod == null ? -Infinity : it.today_hod;
-        const intraday_bo = curr > it.pmh && curr > hod;
+        // intraday_breakout = (curr > premarket high) AND (curr > VWAP)
+        const intraday_bo = curr > it.pmh && it.vwap != null && curr > it.vwap;
         const result = (daily_bo && intraday_bo) ? 'PASS' : (!daily_bo ? 'fail_daily' : 'fail_intraday');
         metrics[sym] = {
           curr_price: curr, prev_daily_high: d.prev_daily_high, prev_daily_close: d.prev_daily_close,
-          sma200: d.sma200, pmh: it.pmh, today_hod: it.today_hod, daily_breakout: daily_bo, intraday_breakout: intraday_bo,
+          sma200: d.sma200, pmh: it.pmh, vwap: it.vwap, today_hod: it.today_hod, daily_breakout: daily_bo, intraday_breakout: intraday_bo,
         };
         all_results.push({ symbol: sym, result });
         if (result === 'PASS') process.stderr.write(`  >>> PASS ${sym} @ ${curr}\n`);
@@ -278,7 +290,7 @@ async function main() {
 
   const hits = passSyms.map(sym => ({
     symbol: sym, curr_price: metrics[sym].curr_price, prev_daily_high: metrics[sym].prev_daily_high,
-    sma200: metrics[sym].sma200, pmh: metrics[sym].pmh, today_hod: metrics[sym].today_hod,
+    sma200: metrics[sym].sma200, pmh: metrics[sym].pmh, vwap: metrics[sym].vwap, today_hod: metrics[sym].today_hod,
     long_reason: catalysts[sym].reason, headlines: catalysts[sym].headlines, source: catalysts[sym].source,
   }));
 
