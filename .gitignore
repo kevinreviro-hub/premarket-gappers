@@ -14,3 +14,8 @@ __pycache__/
 pluang_us_stocks.csv
 tjl_watchlist_*.json
 .tjl_done_*
+bow_watchlist_*.json
+.bow_done_*
+tjl_backtest_combined.json
+tjl_trades.json
+meanrev_combined.json
