@@ -185,7 +185,7 @@ function renderTjl(doc) {
   ];
   if (!hits.length) { lines.push('*No long setups passed the filters today.*'); return lines.join('\n'); }
   lines.push(`*:white_check_mark: LONG candidates (${hits.length}):*`);
-  const MAX = 15;   // cap the webhook message (long messages get dropped by Slack)
+  const MAX = 30;   // cap the webhook message (very long messages get dropped by Slack)
   for (const h of hits.slice(0, MAX)) {
     const why = h.long_reason ? ` — ${String(h.long_reason).slice(0, 130)}${h.source ? ` _(${h.source})_` : ''}` : '';
     lines.push(`*${h.symbol}* $${h.curr_price} _(>${h.prev_daily_high} hi · >VWAP ${h.vwap})_${why}`);
