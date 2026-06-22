@@ -115,6 +115,8 @@ function render(doc) {
 
 async function main() {
   const asof = etDate();
+  const etWd = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', weekday: 'short' }).format(new Date());
+  if (SCHEDULED && (etWd === 'Sat' || etWd === 'Sun')) { console.error(`weekend (${etWd} ET) — skip, no fresh US session`); return; }
   if (SCHEDULED) { const marker = `./.bow_done_${asof}`; if (existsSync(marker)) { console.error(`already ran for ${asof} — skip`); return; } }
   const syms = loadSymbols();
   console.error(`BOW scan: ${syms.length} tickers, asof ${asof} (ET)`);
