@@ -254,7 +254,13 @@ async function obPlan(entry) {
 async function main() {
   const ny = nyParts();
 
-  const health = await healthCheck();
+  let health = await healthCheck();
+  // A freshly (re)launched TradingView opens the CDP port within ~2s but the chart API
+  // (window.TradingViewApi) loads later. Wait up to ~90s for the API before giving up.
+  for (let i = 0; i < 30 && health.cdp_connected && !health.api_available; i++) {
+    await new Promise(r => setTimeout(r, 3000));
+    health = await healthCheck();
+  }
   if (!health.cdp_connected || !health.api_available) {
     console.error('TradingView not reachable on CDP 9222 (cdp=%s api=%s).', health.cdp_connected, health.api_available);
     console.error('Launch it (Windows / this machine):');
