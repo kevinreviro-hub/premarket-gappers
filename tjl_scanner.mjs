@@ -168,6 +168,33 @@ function fetchCatalyst(ticker) {
   return { reason: null, headlines: [], source: null };
 }
 
+// Market caps for a list of tickers via Yahoo quote (needs cookie+crumb). Best-effort:
+// returns { SYM: marketCap } for whatever resolves; {} on failure (caller falls back).
+async function fetchMarketCaps(symbols) {
+  const out = {};
+  const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
+  try {
+    let cookie = '';
+    for (const u of ['https://fc.yahoo.com/', 'https://finance.yahoo.com/']) {
+      try { const c = await fetch(u, { headers: { 'User-Agent': UA } }); cookie = (c.headers.get('set-cookie') || '').split(';')[0]; if (cookie) break; } catch {}
+    }
+    const cr = await fetch('https://query2.finance.yahoo.com/v1/test/getcrumb', { headers: { 'User-Agent': UA, 'Cookie': cookie } });
+    const crumb = (await cr.text()).trim();
+    if (!crumb || crumb.length > 30) return out;
+    for (let i = 0; i < symbols.length; i += 50) {
+      const chunk = symbols.slice(i, i + 50);
+      const ysyms = chunk.map(s => s.replace(/\./g, '-'));
+      const q = await fetch(`https://query2.finance.yahoo.com/v7/finance/quote?symbols=${ysyms.join(',')}&crumb=${encodeURIComponent(crumb)}`, { headers: { 'User-Agent': UA, 'Cookie': cookie } });
+      const j = await q.json();
+      for (const r of ((j && j.quoteResponse && j.quoteResponse.result) || [])) {
+        const orig = chunk.find(s => s.replace(/\./g, '-').toUpperCase() === String(r.symbol).toUpperCase()) || r.symbol;
+        if (r.marketCap != null) out[orig] = r.marketCap;
+      }
+    }
+  } catch { /* best-effort */ }
+  return out;
+}
+
 function resolveWebhook() {
   if (process.env.SLACK_WEBHOOK_URL) return process.env.SLACK_WEBHOOK_URL.trim();
   try { return readFileSync('./.slack_webhook', 'utf8').trim() || null; } catch { return null; }
@@ -188,7 +215,7 @@ function renderTjl(doc) {
   const MAX = 30;   // cap the webhook message (very long messages get dropped by Slack)
   for (const h of hits.slice(0, MAX)) {
     const why = h.long_reason ? ` — ${String(h.long_reason).slice(0, 130)}${h.source ? ` _(${h.source})_` : ''}` : '';
-    lines.push(`*${h.symbol}* $${h.curr_price} _(>${h.prev_daily_high} hi · >VWAP ${h.vwap})_${why}`);
+    lines.push(`*${h.symbol}* $${h.curr_price} _(${h.market_cap ? `$${(h.market_cap / 1e9).toFixed(0)}B · ` : ''}>${h.prev_daily_high} hi · >VWAP ${h.vwap})_${why}`);
     if (h.plan && h.plan.stop != null) lines.push(`   :dart: stop *${h.plan.stop}* (support OB) · target *${h.plan.target}* _(${h.plan.target_basis})_ · R:R *${h.plan.rr}*`);
   }
   if (hits.length > MAX) lines.push(`_…and ${hits.length - MAX} more — full list in the saved JSON._`);
@@ -333,20 +360,35 @@ async function main() {
   }
   const spanMin = Math.round((new Date() - scanStart) / 60000);
 
-  // PASS = long candidates -> fetch the long thesis / catalyst (Benzinga via claude -p)
+  // PASS = long candidates. Enriching every pass (Benzinga catalyst via claude -p + 15m OB
+  // plan via chart switch) is slow, so only FEATURE the 10 largest + 5 smallest by market
+  // cap. The rest are still listed (no catalyst/plan). Falls back to first 15 if caps fail.
   const passSyms = all_results.filter(r => r.result === 'PASS').map(r => r.symbol);
+  const mcap = await fetchMarketCaps(passSyms);
+  const ranked = passSyms.filter(s => mcap[s] != null).sort((a, b) => mcap[b] - mcap[a]);
+  let featured;
+  if (ranked.length >= 15) featured = [...new Set([...ranked.slice(0, 10), ...ranked.slice(-5)])];   // 10 highest + 5 lowest
+  else featured = passSyms.slice(0, 15);                                                              // caps unavailable -> first 15
+  const featuredSet = new Set(featured);
+  process.stderr.write(`enrich: ${featured.length}/${passSyms.length} featured (10 highest + 5 lowest market cap)\n`);
+
   const catalysts = {}, plans = {};
-  for (const sym of passSyms) {
-    process.stderr.write(`enrich PASS: ${sym} (catalyst + OB plan) ...\n`);
+  for (const sym of featured) {
+    const mc = mcap[sym] != null ? `$${(mcap[sym] / 1e9).toFixed(1)}B` : '?';
+    process.stderr.write(`enrich PASS: ${sym} (mcap ${mc}) ...\n`);
     catalysts[sym] = fetchCatalyst(sym);                                  // claude -p (no chart)
     try { await setSymbol(sym); plans[sym] = await obPlan(metrics[sym].curr_price); } // 15m OB/BB plan
     catch (e) { plans[sym] = null; process.stderr.write(`  ! ${sym} plan error: ${String(e.message || e).slice(0, 60)}\n`); }
   }
 
-  const hits = passSyms.map(sym => ({
+  // featured first (largest->smallest), then the rest by market cap, so the post leads with them
+  const rest = passSyms.filter(s => !featuredSet.has(s)).sort((a, b) => (mcap[b] || 0) - (mcap[a] || 0));
+  const orderedSyms = [...featured.sort((a, b) => (mcap[b] || 0) - (mcap[a] || 0)), ...rest];
+  const hits = orderedSyms.map(sym => ({
     symbol: sym, curr_price: metrics[sym].curr_price, prev_daily_high: metrics[sym].prev_daily_high,
+    market_cap: mcap[sym] != null ? mcap[sym] : null, featured: featuredSet.has(sym),
     sma200: metrics[sym].sma200, pmh: metrics[sym].pmh, vwap: metrics[sym].vwap, today_hod: metrics[sym].today_hod,
-    long_reason: catalysts[sym].reason, headlines: catalysts[sym].headlines, source: catalysts[sym].source,
+    long_reason: (catalysts[sym] || {}).reason || null, headlines: (catalysts[sym] || {}).headlines || [], source: (catalysts[sym] || {}).source || null,
     plan: plans[sym] || null,
   }));
 
